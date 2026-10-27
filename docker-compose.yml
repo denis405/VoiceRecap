@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    image: voicerecap:latest
+    container_name: voicerecap
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

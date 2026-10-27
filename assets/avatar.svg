@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6A4DFF"/>
+      <stop offset="0.55" stop-color="#4F6BFF"/>
+      <stop offset="1" stop-color="#22C1D6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.3" cy="0.25" r="0.75">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="640" height="640" fill="url(#bg)"/>
+  <rect width="640" height="640" fill="url(#glow)"/>
+
+  <!-- sound wave -->
+  <g fill="#FFFFFF">
+    <rect x="118" y="275" width="28" height="90"  rx="14"/>
+    <rect x="164" y="230" width="28" height="180" rx="14"/>
+    <rect x="210" y="190" width="28" height="260" rx="14"/>
+    <rect x="256" y="245" width="28" height="150" rx="14"/>
+    <rect x="302" y="285" width="28" height="70"  rx="14"/>
+  </g>
+
+  <!-- arrow -->
+  <path d="M352 296 L376 320 L352 344" fill="none" stroke="#FFFFFF" stroke-opacity="0.75"
+        stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- recap lines -->
+  <g stroke="#FFFFFF" stroke-width="32" stroke-linecap="round">
+    <line x1="414" y1="258" x2="526" y2="258"/>
+    <line x1="414" y1="320" x2="500" y2="320"/>
+    <line x1="414" y1="382" x2="466" y2="382"/>
+  </g>
+
+  <!-- sparkle -->
+  <path d="M520 160 Q524 186 548 190 Q524 194 520 220 Q516 194 492 190 Q516 186 520 160 Z" fill="#FFFFFF"/>
+</svg>

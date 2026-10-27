@@ -1,0 +1,54 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  DEPLOY_HOST: 194.67.200.155
+  DEPLOY_USER: root
+  DEPLOY_PATH: /opt/voicerecap
+  # pinned host key: ssh-keyscan -t ed25519 194.67.200.155
+  KNOWN_HOST: 194.67.200.155 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJhZgMVgWZM1rEEfDy8HLgDryp5fBdiyovTaw49XnjTi
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # the server has ~700 MB RAM and little disk, so the image is built here and shipped ready
+      - name: Build image
+        run: docker build -t voicerecap:latest .
+
+      - name: Set up SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          [ -n "$SSH_PRIVATE_KEY" ] || { echo "::error::secret SSH_PRIVATE_KEY is not set"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOST" > ~/.ssh/known_hosts
+
+      - name: Upload image and compose file
+        run: |
+          docker save voicerecap:latest | gzip | ssh $DEPLOY_USER@$DEPLOY_HOST docker load
+          scp docker-compose.yml $DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/docker-compose.yml
+
+      - name: Restart bot
+        run: |
+          ssh $DEPLOY_USER@$DEPLOY_HOST "cd $DEPLOY_PATH && docker compose up -d --no-build --remove-orphans && docker image prune -f"
+
+      - name: Check bot is running
+        run: |
+          sleep 15
+          ssh $DEPLOY_USER@$DEPLOY_HOST '
+            docker logs --tail 30 voicerecap
+            [ "$(docker inspect -f "{{.State.Running}} {{.RestartCount}}" voicerecap)" = "true 0" ]
+          '
