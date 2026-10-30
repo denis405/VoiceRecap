@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,21 +12,39 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://openrouter.ai/api/v1"
 RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
-SUMMARY_PROMPT = """Ты помогаешь быстро понять содержание голосового сообщения. Тебе дают его автоматическую расшифровку.
+SUMMARY_PROMPT = """Ты помогаешь быстро понять содержание голосового сообщения и ответить на него. Тебе дают его автоматическую расшифровку.
 
-Сделай краткий пересказ:
+1. Сделай краткий пересказ (поле summary):
 - Пиши на том же языке, на котором говорит автор.
 - Начни с 1–2 предложений — главная суть.
 - Затем 3–7 пунктов, каждый с новой строки и символа «• », — ключевые мысли, факты, просьбы.
 - Если есть задачи, договорённости, сроки, даты, суммы, имена или контакты — добавь блок «Задачи и договорённости:» (или аналог на языке автора) с пунктами «• ».
 - Если сообщение очень короткое или простое — хватит одного предложения, без пунктов.
-- Пересказывай от третьего лица («Автор просит…», «Говорит, что…»).
+- Пересказывай от третьего лица. Если известно имя автора — называй его по имени («Саша просит…»), иначе «Автор просит…». О том, кому адресовано сообщение, пиши «тебя», «тебе» («зовёт тебя на дачу»), не «получатель».
 - Ничего не выдумывай и не добавляй от себя. Ошибки распознавания исправляй по смыслу, только если уверен.
-- Только обычный текст: без Markdown, без звёздочек, решёток и заголовков."""
+- Только обычный текст: без Markdown, без звёздочек, решёток и заголовков.
+
+2. Если тебя просят варианты ответа — предложи 2–3 готовых ответа (поле replies), которые получатель может сразу скопировать и отправить автору:
+- Выбери самые уместные для этого сообщения: согласие, отказ, уточняющий вопрос, «сделаю позже», поддержка, «принял» и т. п. Один из вариантов — нейтральный, ни к чему не обязывающий.
+- Пиши от первого лица получателя, на языке автора, с тем же «ты» или «вы» и в том же тоне.
+- Это продолжение уже идущей переписки: без приветствий, без обращения по имени в начале, без подписи и без «спасибо за сообщение». Поздороваться можно, только если автор сам начал с приветствия.
+- Как в мессенджере: 1–2 короткие фразы, не длиннее 200 символов, без канцелярита.
+- Не выдумывай факты, которых получатель не сообщал (время, суммы, планы), и не ставь заглушки вроде [время]. Если для ответа нужна такая информация — сформулируй так, чтобы она не требовалась, или задай вопрос.
+- label — суть ответа в 1–2 словах, не длиннее 14 символов, на языке ответа: «Да, приеду», «Уточнить», «Отложить», «Принял».
+- Если отвечать не на что (рассылка, монолог, заметка) — оставь replies пустым.
+Если варианты ответа не нужны — replies всегда пустой.
+
+Ответь только JSON-объектом, без пояснений и без ```:
+{"summary": "...", "replies": [{"label": "...", "text": "..."}]}"""
 
 
 class OpenRouterError(RuntimeError):
     pass
+
+
+REPLY_TEXT_LIMIT = 256  # Telegram's limit for a copy_text button
+REPLY_LABEL_LIMIT = 16
+MAX_REPLIES = 3
 
 
 @dataclass
@@ -36,12 +55,46 @@ class Transcription:
 
 
 @dataclass
+class Reply:
+    label: str  # short button caption
+    text: str  # the reply itself, copied by the button
+
+
+@dataclass
 class Summary:
     text: str
+    replies: list[Reply]
     prompt_tokens: int
     completion_tokens: int
     reasoning_tokens: int
     cost: float  # USD
+
+
+def parse_summary(raw: str) -> tuple[str, list[Reply]]:
+    """Split the model's JSON answer into summary and replies; a non-JSON answer is taken as a bare summary."""
+    raw = raw.strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    try:
+        data = json.loads(raw[start : end + 1]) if 0 <= start < end else None
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict) or not isinstance(data.get("summary"), str):
+        log.warning("Summary is not JSON, replies dropped: %r", raw[:200])
+        return raw, []
+
+    replies = []
+    for item in data.get("replies") or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        text = str(item.get("text") or "").strip()
+        # a reply the button can't copy whole is useless
+        if not label or not text or len(text) > REPLY_TEXT_LIMIT:
+            continue
+        if len(label) > REPLY_LABEL_LIMIT:
+            label = label[: REPLY_LABEL_LIMIT - 1].rstrip() + "…"
+        replies.append(Reply(label, text))
+    return data["summary"].strip(), replies[:MAX_REPLIES]
 
 
 class OpenRouter:
@@ -97,12 +150,15 @@ class OpenRouter:
             cost=float(usage.get("cost") or 0),
         )
 
-    async def summarize(self, transcript: str) -> Summary:
+    async def summarize(self, transcript: str, author: str | None = None, want_replies: bool = False) -> Summary:
+        """author: the sender's name, if known; want_replies: also suggest ready-to-send replies."""
+        context = [f"Автор: {author}" if author else "Имя автора неизвестно"]
+        context.append("Варианты ответа: нужны" if want_replies else "Варианты ответа: не нужны")
         payload = {
             "model": self.summary_model,
             "messages": [
                 {"role": "system", "content": SUMMARY_PROMPT},
-                {"role": "user", "content": f"Расшифровка:\n\n{transcript}"},
+                {"role": "user", "content": "\n".join(context) + f"\n\nРасшифровка:\n\n{transcript}"},
             ],
             "temperature": 0.3,
             "max_tokens": 1500,
@@ -114,8 +170,10 @@ class OpenRouter:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise OpenRouterError(f"unexpected chat response: {str(data)[:500]}") from e
+        summary, replies = parse_summary(text or "")
         return Summary(
-            text=(text or "").strip(),
+            text=summary,
+            replies=replies if want_replies else [],
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
             reasoning_tokens=int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
@@ -137,10 +195,11 @@ async def _smoke(path: str) -> None:
             chunks = await to_mp3_chunks(Path(path), Path(tmp), settings.chunk_sec)
             parts = [await api.transcribe(c, settings.stt_language) for c in chunks]
         transcript = " ".join(p.text for p in parts)
-        summary = await api.summarize(transcript)
+        summary = await api.summarize(transcript, want_replies=True)
         stt_cost = sum(p.cost for p in parts)
         print("--- transcript ---\n" + transcript)
         print("--- summary ---\n" + summary.text)
+        print("--- replies ---\n" + "\n".join(f"[{r.label}] {r.text}" for r in summary.replies))
         print(
             f"--- cost ---\nSTT ${stt_cost:.6f} ({sum(p.seconds for p in parts):.1f}s), "
             f"LLM ${summary.cost:.6f} ({summary.prompt_tokens} in / {summary.completion_tokens} out), "

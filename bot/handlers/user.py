@@ -11,9 +11,14 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageOriginChannel,
+    MessageOriginChat,
+    MessageOriginHiddenUser,
+    MessageOriginUser,
 )
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -22,7 +27,7 @@ from bot.audio import to_mp3_chunks
 from bot.config import settings
 from bot.db import REQ_EMPTY, REQ_OK, REQ_TOO_BIG, REQ_TOO_LONG, Database, Request
 from bot.fmt import fmt_duration
-from bot.openrouter import OpenRouter
+from bot.openrouter import OpenRouter, Reply
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +35,8 @@ router = Router(name="user")
 
 TG_TEXT_LIMIT = 4000
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+# longer recordings are meetings and lectures rather than messages to answer
+REPLIES_MAX_DURATION_SEC = 7 * 60
 
 
 class FullTextCb(CallbackData, prefix="full"):
@@ -61,6 +68,46 @@ def settings_keyboard(current: str) -> InlineKeyboardMarkup:
         for code, name in texts.LANGUAGES.items()
     ]
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i : i + 2] for i in range(0, len(buttons), 2)])
+
+
+def voice_author(message: Message) -> tuple[str | None, bool]:
+    """(name of whoever recorded the voice, whether to suggest replies). The user's own voices are notes to self."""
+    origin = message.forward_origin
+    if isinstance(origin, MessageOriginUser):
+        if origin.sender_user.id == message.from_user.id:
+            return None, False
+        return origin.sender_user.full_name, True
+    if isinstance(origin, MessageOriginHiddenUser):
+        return origin.sender_user_name, True
+    if isinstance(origin, MessageOriginChat):
+        return origin.author_signature or origin.sender_chat.title, True
+    if isinstance(origin, MessageOriginChannel):
+        return origin.chat.title, False
+    return None, False
+
+
+def result_message(duration: int, body: str, replies: list[Reply], transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    header = f"🎙 {fmt_duration(duration)} · 📝 Кратко\n\n"
+    footer = ""
+    if replies:
+        footer = f"\n\n{texts.REPLIES_TITLE}\n" + "\n".join(f"{i}. {r.text}" for i, r in enumerate(replies, 1))
+    room = TG_TEXT_LIMIT - len(header) - len(footer)
+    if len(body) > room:
+        body = body[: room - 1] + "…"
+
+    rows = []
+    if replies:
+        rows.append([
+            InlineKeyboardButton(text=f"📋 {r.label}", copy_text=CopyTextButton(text=r.text))
+            for r in replies
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text=texts.FULL_TEXT_BUTTON,
+            callback_data=FullTextCb(transcript_id=transcript_id).pack(),
+        )
+    ])
+    return header + body + footer, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def set_status(status: Message, text: str, **kwargs) -> None:
@@ -161,7 +208,9 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
                 return
 
             await set_status(status, texts.STATUS_SUMMARIZING)
-            result = await api.summarize(transcript)
+            author, answerable = voice_author(message)
+            want_replies = answerable and duration <= REPLIES_MAX_DURATION_SEC
+            result = await api.summarize(transcript, author, want_replies)
             summary = result.text
             req.summary_chars = len(summary)
             req.llm_prompt_tokens = result.prompt_tokens
@@ -179,20 +228,12 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
         req.processing_ms = int((time.monotonic() - started) * 1000)
         await record_request(db, req)
 
-    header = f"🎙 {fmt_duration(duration)} · 📝 Кратко\n\n"
-    body = summary or transcript
-    if len(header) + len(body) > TG_TEXT_LIMIT:
-        body = body[: TG_TEXT_LIMIT - len(header) - 1] + "…"
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text=texts.FULL_TEXT_BUTTON,
-                callback_data=FullTextCb(transcript_id=transcript_id).pack(),
-            )
-        ]]
+    text, keyboard = result_message(duration, summary or transcript, result.replies, transcript_id)
+    await set_status(status, text, reply_markup=keyboard)
+    log.info(
+        "Processed %ss voice for %s (%d chars, %d replies)",
+        duration, message.from_user.id, len(transcript), len(result.replies),
     )
-    await set_status(status, header + body, reply_markup=keyboard)
-    log.info("Processed %ss voice for %s (%d chars)", duration, message.from_user.id, len(transcript))
 
 
 @router.callback_query(FullTextCb.filter())
@@ -210,9 +251,17 @@ async def on_full_text(query: CallbackQuery, callback_data: FullTextCb, db: Data
             BufferedInputFile(transcript.encode(), filename=f"transcript_{callback_data.transcript_id}.txt"),
             caption="📄 Полная расшифровка",
         )
-    # one-shot button: drop it once the full text is out
+    # one-shot button: drop it once the full text is out, keep the reply buttons
+    markup = query.message.reply_markup
+    rows = [
+        [b for b in row if b.callback_data != query.data]
+        for row in (markup.inline_keyboard if markup else [])
+    ]
+    rows = [row for row in rows if row]
     try:
-        await query.message.edit_reply_markup(reply_markup=None)
+        await query.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        )
     except TelegramBadRequest:
         pass
 
