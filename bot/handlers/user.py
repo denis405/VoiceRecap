@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import tempfile
 import time
@@ -11,7 +12,6 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -40,6 +40,10 @@ REPLIES_MAX_DURATION_SEC = 7 * 60
 
 
 class FullTextCb(CallbackData, prefix="full"):
+    transcript_id: int
+
+
+class RepliesCb(CallbackData, prefix="replies"):
     transcript_id: int
 
 
@@ -86,28 +90,46 @@ def voice_author(message: Message) -> tuple[str | None, bool]:
     return None, False
 
 
-def result_message(duration: int, body: str, replies: list[Reply], transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
+def result_message(duration: int, body: str, has_replies: bool, transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
     header = f"🎙 {fmt_duration(duration)} · 📝 Кратко\n\n"
-    footer = ""
-    if replies:
-        footer = f"\n\n{texts.REPLIES_TITLE}\n" + "\n".join(f"{i}. {r.text}" for i, r in enumerate(replies, 1))
-    room = TG_TEXT_LIMIT - len(header) - len(footer)
-    if len(body) > room:
-        body = body[: room - 1] + "…"
-
-    rows = []
-    if replies:
-        rows.append([
-            InlineKeyboardButton(text=f"📋 {r.label}", copy_text=CopyTextButton(text=r.text))
-            for r in replies
-        ])
-    rows.append([
+    if len(header) + len(body) > TG_TEXT_LIMIT:
+        body = body[: TG_TEXT_LIMIT - len(header) - 1] + "…"
+    buttons = [
         InlineKeyboardButton(
             text=texts.FULL_TEXT_BUTTON,
             callback_data=FullTextCb(transcript_id=transcript_id).pack(),
         )
-    ])
-    return header + body + footer, InlineKeyboardMarkup(inline_keyboard=rows)
+    ]
+    if has_replies:
+        buttons.append(
+            InlineKeyboardButton(
+                text=texts.REPLIES_BUTTON,
+                callback_data=RepliesCb(transcript_id=transcript_id).pack(),
+            )
+        )
+    return header + body, InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def replies_message(replies: list[Reply]) -> str:
+    """HTML: each reply in <code>, which Telegram copies on tap."""
+    blocks = [f"<b>{html.escape(r.label)}</b>\n<code>{html.escape(r.text)}</code>" for r in replies]
+    return f"<b>{texts.REPLIES_TITLE}</b>\n<i>{texts.REPLIES_HINT}</i>\n\n" + "\n\n".join(blocks)
+
+
+async def drop_button(query: CallbackQuery) -> None:
+    """One-shot buttons: remove the pressed one, keep the rest."""
+    markup = query.message.reply_markup
+    rows = [
+        [b for b in row if b.callback_data != query.data]
+        for row in (markup.inline_keyboard if markup else [])
+    ]
+    rows = [row for row in rows if row]
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        )
+    except TelegramBadRequest:
+        pass
 
 
 async def set_status(status: Message, text: str, **kwargs) -> None:
@@ -218,6 +240,8 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
             req.llm_reasoning_tokens = result.reasoning_tokens
             req.llm_cost = result.cost
             transcript_id = await db.save_transcript(message.from_user.id, transcript)
+            if result.replies:
+                await db.save_replies(transcript_id, [(r.label, r.text) for r in result.replies])
             req.transcript_id = transcript_id
             req.status = REQ_OK
     except Exception:
@@ -228,7 +252,7 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
         req.processing_ms = int((time.monotonic() - started) * 1000)
         await record_request(db, req)
 
-    text, keyboard = result_message(duration, summary or transcript, result.replies, transcript_id)
+    text, keyboard = result_message(duration, summary or transcript, bool(result.replies), transcript_id)
     await set_status(status, text, reply_markup=keyboard)
     log.info(
         "Processed %ss voice for %s (%d chars, %d replies)",
@@ -251,19 +275,18 @@ async def on_full_text(query: CallbackQuery, callback_data: FullTextCb, db: Data
             BufferedInputFile(transcript.encode(), filename=f"transcript_{callback_data.transcript_id}.txt"),
             caption="📄 Полная расшифровка",
         )
-    # one-shot button: drop it once the full text is out, keep the reply buttons
-    markup = query.message.reply_markup
-    rows = [
-        [b for b in row if b.callback_data != query.data]
-        for row in (markup.inline_keyboard if markup else [])
-    ]
-    rows = [row for row in rows if row]
-    try:
-        await query.message.edit_reply_markup(
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-        )
-    except TelegramBadRequest:
-        pass
+    await drop_button(query)
+
+
+@router.callback_query(RepliesCb.filter())
+async def on_replies(query: CallbackQuery, callback_data: RepliesCb, db: Database) -> None:
+    replies = await db.get_replies(callback_data.transcript_id, query.from_user.id)
+    if not replies:
+        await query.answer(texts.REPLIES_NOT_FOUND, show_alert=True)
+        return
+    await query.answer()
+    await query.message.reply(replies_message([Reply(*r) for r in replies]), parse_mode="HTML")
+    await drop_button(query)
 
 
 @router.message()

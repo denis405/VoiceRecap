@@ -1,3 +1,4 @@
+import json
 import time
 from dataclasses import asdict, dataclass
 
@@ -47,6 +48,10 @@ CREATE INDEX IF NOT EXISTS requests_user_time ON requests (user_id, created_at);
 CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS transcript_replies (
+    transcript_id  INTEGER PRIMARY KEY,
+    replies        TEXT NOT NULL  -- JSON: [[label, text], ...]
 );
 CREATE TABLE IF NOT EXISTS user_settings (
     user_id       INTEGER PRIMARY KEY,
@@ -231,6 +236,22 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
+
+    async def save_replies(self, transcript_id: int, replies: list[tuple[str, str]]) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO transcript_replies (transcript_id, replies) VALUES (?, ?)",
+            (transcript_id, json.dumps(replies, ensure_ascii=False)),
+        )
+        await self.conn.commit()
+
+    async def get_replies(self, transcript_id: int, user_id: int) -> list[tuple[str, str]] | None:
+        async with self.conn.execute(
+            "SELECT r.replies FROM transcript_replies r JOIN transcripts t ON t.id = r.transcript_id "
+            "WHERE r.transcript_id = ? AND t.user_id = ?",
+            (transcript_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return [tuple(r) for r in json.loads(row[0])] if row else None
 
     # usage stats
 
