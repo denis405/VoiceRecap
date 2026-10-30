@@ -27,7 +27,7 @@ from bot.audio import to_mp3_chunks
 from bot.config import settings
 from bot.db import REQ_EMPTY, REQ_OK, REQ_TOO_BIG, REQ_TOO_LONG, Database, Request
 from bot.fmt import fmt_duration
-from bot.openrouter import OpenRouter, Reply
+from bot.openrouter import OpenRouter, Recap, Reply
 
 log = logging.getLogger(__name__)
 
@@ -90,10 +90,31 @@ def voice_author(message: Message) -> tuple[str | None, bool]:
     return None, False
 
 
-def result_message(duration: int, body: str, has_replies: bool, transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    header = f"🎙 {fmt_duration(duration)} · 📝 Кратко\n\n"
-    if len(header) + len(body) > TG_TEXT_LIMIT:
-        body = body[: TG_TEXT_LIMIT - len(header) - 1] + "…"
+def recap_lines(recap: Recap) -> list[tuple[str, bool]]:
+    """(text, bold) per line of the summary message."""
+    # a lone gist is the whole recap (or a raw fallback text), not a lead to stand out
+    lines = [(recap.gist, bool(recap.points or recap.tasks))] if recap.gist else []
+    if recap.points:
+        lines += [("", False)] + [(f"• {p}", False) for p in recap.points]
+    if recap.tasks:
+        lines += [("", False), (texts.TASKS_TITLE, True)] + [(f"• {t}", False) for t in recap.tasks]
+    return lines
+
+
+def result_message(duration: int, recap: Recap, has_replies: bool, transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """HTML. Telegram's length limit counts the text without markup, so only plain lengths are summed."""
+    header = f"🎙 {fmt_duration(duration)} · 📝 Кратко"
+    out, size = [header, ""], len(header) + 2
+    for text, bold in recap_lines(recap):
+        room = TG_TEXT_LIMIT - size - 1
+        cut = len(text) > room
+        if cut:
+            text = text[: max(room - 1, 0)] + "…"
+        line = html.escape(text)
+        out.append(f"<b>{line}</b>" if bold and line else line)
+        size += len(text) + 1
+        if cut:
+            break
     buttons = [
         InlineKeyboardButton(
             text=texts.FULL_TEXT_BUTTON,
@@ -107,7 +128,7 @@ def result_message(duration: int, body: str, has_replies: bool, transcript_id: i
                 callback_data=RepliesCb(transcript_id=transcript_id).pack(),
             )
         )
-    return header + body, InlineKeyboardMarkup(inline_keyboard=[buttons])
+    return "\n".join(out), InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def replies_message(replies: list[Reply]) -> str:
@@ -233,8 +254,8 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
             author, answerable = voice_author(message)
             want_replies = answerable and duration <= REPLIES_MAX_DURATION_SEC
             result = await api.summarize(transcript, author, want_replies)
-            summary = result.text
-            req.summary_chars = len(summary)
+            recap = result.recap if result.recap.text.strip() else Recap(transcript, [], [])
+            req.summary_chars = len(result.recap.text)
             req.llm_prompt_tokens = result.prompt_tokens
             req.llm_completion_tokens = result.completion_tokens
             req.llm_reasoning_tokens = result.reasoning_tokens
@@ -252,8 +273,8 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
         req.processing_ms = int((time.monotonic() - started) * 1000)
         await record_request(db, req)
 
-    text, keyboard = result_message(duration, summary or transcript, bool(result.replies), transcript_id)
-    await set_status(status, text, reply_markup=keyboard)
+    text, keyboard = result_message(duration, recap, bool(result.replies), transcript_id)
+    await set_status(status, text, reply_markup=keyboard, parse_mode="HTML")
     log.info(
         "Processed %ss voice for %s (%d chars, %d replies)",
         duration, message.from_user.id, len(transcript), len(result.replies),

@@ -35,6 +35,8 @@ ERROR_TOO_BIG = "⚠️ Файл больше 20 МБ — Telegram не даёт
 ERROR_EMPTY = "🤷 Не удалось распознать речь в этом сообщении."
 TRANSCRIPT_NOT_FOUND = "Расшифровка не найдена"
 
+TASKS_TITLE = "📌 Задачи и договорённости"
+
 FULL_TEXT_BUTTON = "📄 Полный текст"
 REPLIES_BUTTON = "💬 Варианты ответа"
 REPLIES_TITLE = "💬 Варианты ответа"

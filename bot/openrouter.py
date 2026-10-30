@@ -14,18 +14,16 @@ RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 SUMMARY_PROMPT = """Ты помогаешь быстро понять содержание голосового сообщения и ответить на него. Тебе дают его автоматическую расшифровку.
 
-1. Сделай краткий пересказ (поле summary):
+1. Сделай краткий пересказ. Его разбивают на поля, оформлять ничего не нужно — бот сам сверстает сообщение:
+- gist — главная суть: одно короткое предложение, до 25 слов. Если сообщение очень короткое или простое — только gist, остальные поля пустые.
+- points — 2–6 ключевых мыслей, фактов, просьб. Каждый пункт — одна мысль, до 20 слов, без вводных вроде «Также он упоминает, что». Не повторяй gist.
+- tasks — только то, о чём автор прямо просит или договаривается: действия, сроки, даты, суммы, встречи, контакты. Если ничего такого нет — пустой список; не пиши пунктов вроде «Ничего не требуется» или «выслушать автора».
 - Пиши на том же языке, на котором говорит автор.
-- Начни с 1–2 предложений — главная суть.
-- Затем 3–7 пунктов, каждый с новой строки и символа «• », — ключевые мысли, факты, просьбы.
-- Если есть задачи, договорённости, сроки, даты, суммы, имена или контакты — добавь блок «Задачи и договорённости:» (или аналог на языке автора) с пунктами «• ».
-- Если сообщение очень короткое или простое — хватит одного предложения, без пунктов.
 - Пересказывай от третьего лица. Если известно имя автора — называй его по имени («Саша просит…»), иначе «Автор просит…». О том, кому адресовано сообщение, пиши «тебя», «тебе» («зовёт тебя на дачу»), не «получатель».
 - Ничего не выдумывай и не добавляй от себя. Ошибки распознавания исправляй по смыслу, только если уверен.
 - Не додумывай эмоции, мотивы и состояние автора и не давай оценок вроде «тон напряжённый» — пересказывай только сказанное.
-- Блок задач — только если автор сам о чём-то просит или договаривается; не придумывай задачи вроде «выслушать автора».
-- Если расшифровка обрывочная или непонятная — так и скажи одной фразой («Сообщение обрывочное: …») и перескажи то, что разборчиво.
-- Только обычный текст: без Markdown, без звёздочек, решёток и заголовков.
+- Если расшифровка обрывочная или непонятная — так и скажи в gist («Сообщение обрывочное: …») и перескажи в points то, что разборчиво.
+- Только обычный текст: без Markdown, звёздочек, решёток, маркеров «•» и «-» в начале пунктов.
 
 2. Если тебя просят варианты ответа — предложи 2–3 готовых ответа (поле replies), которые получатель может сразу скопировать и отправить автору:
 - Выбери самые уместные для этого сообщения: согласие, отказ, уточняющий вопрос, «сделаю позже», поддержка, «принял» и т. п. Один из вариантов — нейтральный, ни к чему не обязывающий.
@@ -40,7 +38,7 @@ SUMMARY_PROMPT = """Ты помогаешь быстро понять содер
 Если варианты ответа не нужны — replies всегда пустой.
 
 Ответь только JSON-объектом, без пояснений и без ```:
-{"summary": "...", "replies": [{"label": "...", "text": "..."}]}"""
+{"gist": "...", "points": ["..."], "tasks": ["..."], "replies": [{"label": "...", "text": "..."}]}"""
 
 
 class OpenRouterError(RuntimeError):
@@ -66,8 +64,20 @@ class Reply:
 
 
 @dataclass
+class Recap:
+    gist: str
+    points: list[str]
+    tasks: list[str]  # requests and arrangements, empty when there are none
+
+    @property
+    def text(self) -> str:
+        """Plain-text rendering, for logs and length stats."""
+        return "\n".join([self.gist, *(f"• {p}" for p in self.points), *(f"• {t}" for t in self.tasks)])
+
+
+@dataclass
 class Summary:
-    text: str
+    recap: Recap
     replies: list[Reply]
     prompt_tokens: int
     completion_tokens: int
@@ -75,17 +85,25 @@ class Summary:
     cost: float  # USD
 
 
-def parse_summary(raw: str) -> tuple[str, list[Reply]]:
-    """Split the model's JSON answer into summary and replies; a non-JSON answer is taken as a bare summary."""
+def _items(value) -> list[str]:
+    """A list of non-empty strings, with any bullet the model added anyway stripped."""
+    if not isinstance(value, list):
+        return []
+    return [t for t in (str(v).strip().lstrip("•-–—* ").strip() for v in value) if t]
+
+
+def parse_summary(raw: str) -> tuple[Recap, list[Reply]]:
+    """Split the model's JSON answer into recap and replies; a non-JSON answer is taken as a bare gist."""
     raw = raw.strip()
     start, end = raw.find("{"), raw.rfind("}")
     try:
         data = json.loads(raw[start : end + 1]) if 0 <= start < end else None
     except json.JSONDecodeError:
         data = None
-    if not isinstance(data, dict) or not isinstance(data.get("summary"), str):
+    if not isinstance(data, dict) or not isinstance(data.get("gist"), str):
         log.warning("Summary is not JSON, replies dropped: %r", raw[:200])
-        return raw, []
+        return Recap(raw, [], []), []
+    recap = Recap(data["gist"].strip(), _items(data.get("points")), _items(data.get("tasks")))
 
     replies = []
     for item in data.get("replies") or []:
@@ -98,7 +116,7 @@ def parse_summary(raw: str) -> tuple[str, list[Reply]]:
         if len(label) > REPLY_LABEL_LIMIT:
             label = label[: REPLY_LABEL_LIMIT - 1].rstrip() + "…"
         replies.append(Reply(label, text))
-    return data["summary"].strip(), replies[:MAX_REPLIES]
+    return recap, replies[:MAX_REPLIES]
 
 
 class OpenRouter:
@@ -174,9 +192,9 @@ class OpenRouter:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise OpenRouterError(f"unexpected chat response: {str(data)[:500]}") from e
-        summary, replies = parse_summary(text or "")
+        recap, replies = parse_summary(text or "")
         return Summary(
-            text=summary,
+            recap=recap,
             replies=replies if want_replies else [],
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
@@ -202,7 +220,7 @@ async def _smoke(path: str) -> None:
         summary = await api.summarize(transcript, want_replies=True)
         stt_cost = sum(p.cost for p in parts)
         print("--- transcript ---\n" + transcript)
-        print("--- summary ---\n" + summary.text)
+        print("--- summary ---\n" + summary.recap.text)
         print("--- replies ---\n" + "\n".join(f"[{r.label}] {r.text}" for r in summary.replies))
         print(
             f"--- cost ---\nSTT ${stt_cost:.6f} ({sum(p.seconds for p in parts):.1f}s), "
