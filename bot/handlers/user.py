@@ -27,7 +27,7 @@ from bot.audio import to_mp3_chunks
 from bot.config import settings
 from bot.db import REQ_EMPTY, REQ_OK, REQ_TOO_BIG, REQ_TOO_LONG, Database, Request
 from bot.fmt import fmt_duration
-from bot.openrouter import OpenRouter, Recap, Reply
+from bot.openrouter import OpenRouter, Recap
 
 log = logging.getLogger(__name__)
 
@@ -35,15 +35,9 @@ router = Router(name="user")
 
 TG_TEXT_LIMIT = 4000
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
-# longer recordings are meetings and lectures rather than messages to answer
-REPLIES_MAX_DURATION_SEC = 7 * 60
 
 
 class FullTextCb(CallbackData, prefix="full"):
-    transcript_id: int
-
-
-class RepliesCb(CallbackData, prefix="replies"):
     transcript_id: int
 
 
@@ -74,20 +68,18 @@ def settings_keyboard(current: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i : i + 2] for i in range(0, len(buttons), 2)])
 
 
-def voice_author(message: Message) -> tuple[str | None, bool]:
-    """(name of whoever recorded the voice, whether to suggest replies). The user's own voices are notes to self."""
+def voice_author(message: Message) -> str | None:
+    """Name of whoever recorded the voice. The user's own voices are notes to self, so no name."""
     origin = message.forward_origin
     if isinstance(origin, MessageOriginUser):
-        if origin.sender_user.id == message.from_user.id:
-            return None, False
-        return origin.sender_user.full_name, True
+        return None if origin.sender_user.id == message.from_user.id else origin.sender_user.full_name
     if isinstance(origin, MessageOriginHiddenUser):
-        return origin.sender_user_name, True
+        return origin.sender_user_name
     if isinstance(origin, MessageOriginChat):
-        return origin.author_signature or origin.sender_chat.title, True
+        return origin.author_signature or origin.sender_chat.title
     if isinstance(origin, MessageOriginChannel):
-        return origin.chat.title, False
-    return None, False
+        return origin.chat.title
+    return None
 
 
 def recap_lines(recap: Recap) -> list[tuple[str, bool]]:
@@ -101,7 +93,7 @@ def recap_lines(recap: Recap) -> list[tuple[str, bool]]:
     return lines
 
 
-def result_message(duration: int, recap: Recap, has_replies: bool, transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
+def result_message(duration: int, recap: Recap, transcript_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """HTML. Telegram's length limit counts the text without markup, so only plain lengths are summed."""
     header = f"🎙 {fmt_duration(duration)} · 📝 Кратко"
     out, size = [header, ""], len(header) + 2
@@ -115,26 +107,11 @@ def result_message(duration: int, recap: Recap, has_replies: bool, transcript_id
         size += len(text) + 1
         if cut:
             break
-    buttons = [
-        InlineKeyboardButton(
-            text=texts.FULL_TEXT_BUTTON,
-            callback_data=FullTextCb(transcript_id=transcript_id).pack(),
-        )
-    ]
-    if has_replies:
-        buttons.append(
-            InlineKeyboardButton(
-                text=texts.REPLIES_BUTTON,
-                callback_data=RepliesCb(transcript_id=transcript_id).pack(),
-            )
-        )
-    return "\n".join(out), InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-def replies_message(replies: list[Reply]) -> str:
-    """HTML: each reply in <code>, which Telegram copies on tap."""
-    blocks = [f"<b>{html.escape(r.label)}</b>\n<code>{html.escape(r.text)}</code>" for r in replies]
-    return f"<b>{texts.REPLIES_TITLE}</b>\n<i>{texts.REPLIES_HINT}</i>\n\n" + "\n\n".join(blocks)
+    button = InlineKeyboardButton(
+        text=texts.FULL_TEXT_BUTTON,
+        callback_data=FullTextCb(transcript_id=transcript_id).pack(),
+    )
+    return "\n".join(out), InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
 async def drop_button(query: CallbackQuery) -> None:
@@ -251,9 +228,7 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
                 return
 
             await set_status(status, texts.STATUS_SUMMARIZING)
-            author, answerable = voice_author(message)
-            want_replies = answerable and duration <= REPLIES_MAX_DURATION_SEC
-            result = await api.summarize(transcript, author, want_replies)
+            result = await api.summarize(transcript, voice_author(message))
             recap = result.recap if result.recap.text.strip() else Recap(transcript, [], [])
             req.summary_chars = len(result.recap.text)
             req.llm_prompt_tokens = result.prompt_tokens
@@ -261,8 +236,6 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
             req.llm_reasoning_tokens = result.reasoning_tokens
             req.llm_cost = result.cost
             transcript_id = await db.save_transcript(message.from_user.id, transcript)
-            if result.replies:
-                await db.save_replies(transcript_id, [(r.label, r.text) for r in result.replies])
             req.transcript_id = transcript_id
             req.status = REQ_OK
     except Exception:
@@ -273,12 +246,9 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
         req.processing_ms = int((time.monotonic() - started) * 1000)
         await record_request(db, req)
 
-    text, keyboard = result_message(duration, recap, bool(result.replies), transcript_id)
+    text, keyboard = result_message(duration, recap, transcript_id)
     await set_status(status, text, reply_markup=keyboard, parse_mode="HTML")
-    log.info(
-        "Processed %ss voice for %s (%d chars, %d replies)",
-        duration, message.from_user.id, len(transcript), len(result.replies),
-    )
+    log.info("Processed %ss voice for %s (%d chars)", duration, message.from_user.id, len(transcript))
 
 
 @router.callback_query(FullTextCb.filter())
@@ -296,17 +266,6 @@ async def on_full_text(query: CallbackQuery, callback_data: FullTextCb, db: Data
             BufferedInputFile(transcript.encode(), filename=f"transcript_{callback_data.transcript_id}.txt"),
             caption="📄 Полная расшифровка",
         )
-    await drop_button(query)
-
-
-@router.callback_query(RepliesCb.filter())
-async def on_replies(query: CallbackQuery, callback_data: RepliesCb, db: Database) -> None:
-    replies = await db.get_replies(callback_data.transcript_id, query.from_user.id)
-    if not replies:
-        await query.answer(texts.REPLIES_NOT_FOUND, show_alert=True)
-        return
-    await query.answer()
-    await query.message.reply(replies_message([Reply(*r) for r in replies]), parse_mode="HTML")
     await drop_button(query)
 
 

@@ -12,9 +12,9 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://openrouter.ai/api/v1"
 RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
-SUMMARY_PROMPT = """Ты помогаешь быстро понять содержание голосового сообщения и ответить на него. Тебе дают его автоматическую расшифровку.
+SUMMARY_PROMPT = """Ты помогаешь быстро понять содержание голосового сообщения. Тебе дают его автоматическую расшифровку.
 
-1. Сделай краткий пересказ. Его разбивают на поля, оформлять ничего не нужно — бот сам сверстает сообщение:
+Сделай краткий пересказ. Его разбивают на поля, оформлять ничего не нужно — бот сам сверстает сообщение:
 - gist — главная суть: одно короткое предложение, до 25 слов. Если сообщение очень короткое или простое — только gist, остальные поля пустые.
 - points — 2–6 ключевых мыслей, фактов, просьб. Каждый пункт — одна мысль, до 20 слов, без вводных вроде «Также он упоминает, что». Не повторяй gist.
 - tasks — только то, о чём автор прямо просит или договаривается: действия, сроки, даты, суммы, встречи, контакты. Если ничего такого нет — пустой список; не пиши пунктов вроде «Ничего не требуется» или «выслушать автора».
@@ -25,29 +25,12 @@ SUMMARY_PROMPT = """Ты помогаешь быстро понять содер
 - Если расшифровка обрывочная или непонятная — так и скажи в gist («Сообщение обрывочное: …») и перескажи в points то, что разборчиво.
 - Только обычный текст: без Markdown, звёздочек, решёток, маркеров «•» и «-» в начале пунктов.
 
-2. Если тебя просят варианты ответа — предложи 2–3 готовых ответа (поле replies), которые получатель может сразу скопировать и отправить автору:
-- Выбери самые уместные для этого сообщения: согласие, отказ, уточняющий вопрос, «сделаю позже», поддержка, «принял» и т. п. Один из вариантов — нейтральный, ни к чему не обязывающий.
-- Пиши от первого лица получателя, на языке автора, с тем же «ты» или «вы» и в том же тоне.
-- Это продолжение уже идущей переписки: без приветствий, без обращения по имени в начале, без подписи и без «спасибо за сообщение». Поздороваться можно, только если автор сам начал с приветствия.
-- Как в мессенджере: 1–2 короткие фразы, не длиннее 200 символов, без канцелярита.
-- Не драматизируй: не предполагай кризис, болезнь, опасность или конфликт, если автор прямо об этом не говорит. Отвечай на сказанное, а не на догадки.
-- Если сообщение непонятное или обрывочное — один из вариантов: просто переспросить («Не очень понял, о чём ты, можешь пояснить?»).
-- Не выдумывай факты, которых получатель не сообщал (время, суммы, планы), и не ставь заглушки вроде [время]. Если для ответа нужна такая информация — сформулируй так, чтобы она не требовалась, или задай вопрос.
-- label — заголовок варианта: эмодзи и суть в 1–3 словах, на языке ответа: «👍 Да, приеду», «❓ Уточнить», «⏳ Отложить», «🙏 Принял».
-- Если отвечать не на что (рассылка, монолог, заметка) — оставь replies пустым.
-Если варианты ответа не нужны — replies всегда пустой.
-
 Ответь только JSON-объектом, без пояснений и без ```:
-{"gist": "...", "points": ["..."], "tasks": ["..."], "replies": [{"label": "...", "text": "..."}]}"""
+{"gist": "...", "points": ["..."], "tasks": ["..."]}"""
 
 
 class OpenRouterError(RuntimeError):
     pass
-
-
-REPLY_TEXT_LIMIT = 300  # a reply is a short messenger message, not an essay
-REPLY_LABEL_LIMIT = 24
-MAX_REPLIES = 3
 
 
 @dataclass
@@ -55,12 +38,6 @@ class Transcription:
     text: str
     seconds: float
     cost: float  # USD
-
-
-@dataclass
-class Reply:
-    label: str  # short button caption
-    text: str  # the reply itself, copied by the button
 
 
 @dataclass
@@ -78,7 +55,6 @@ class Recap:
 @dataclass
 class Summary:
     recap: Recap
-    replies: list[Reply]
     prompt_tokens: int
     completion_tokens: int
     reasoning_tokens: int
@@ -92,8 +68,8 @@ def _items(value) -> list[str]:
     return [t for t in (str(v).strip().lstrip("•-–—* ").strip() for v in value) if t]
 
 
-def parse_summary(raw: str) -> tuple[Recap, list[Reply]]:
-    """Split the model's JSON answer into recap and replies; a non-JSON answer is taken as a bare gist."""
+def parse_summary(raw: str) -> Recap:
+    """Parse the model's JSON answer; a non-JSON answer is taken as a bare gist."""
     raw = raw.strip()
     start, end = raw.find("{"), raw.rfind("}")
     try:
@@ -101,22 +77,9 @@ def parse_summary(raw: str) -> tuple[Recap, list[Reply]]:
     except json.JSONDecodeError:
         data = None
     if not isinstance(data, dict) or not isinstance(data.get("gist"), str):
-        log.warning("Summary is not JSON, replies dropped: %r", raw[:200])
-        return Recap(raw, [], []), []
-    recap = Recap(data["gist"].strip(), _items(data.get("points")), _items(data.get("tasks")))
-
-    replies = []
-    for item in data.get("replies") or []:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("label") or "").strip()
-        text = str(item.get("text") or "").strip()
-        if not label or not text or len(text) > REPLY_TEXT_LIMIT:
-            continue
-        if len(label) > REPLY_LABEL_LIMIT:
-            label = label[: REPLY_LABEL_LIMIT - 1].rstrip() + "…"
-        replies.append(Reply(label, text))
-    return recap, replies[:MAX_REPLIES]
+        log.warning("Summary is not JSON: %r", raw[:200])
+        return Recap(raw, [], [])
+    return Recap(data["gist"].strip(), _items(data.get("points")), _items(data.get("tasks")))
 
 
 class OpenRouter:
@@ -172,15 +135,14 @@ class OpenRouter:
             cost=float(usage.get("cost") or 0),
         )
 
-    async def summarize(self, transcript: str, author: str | None = None, want_replies: bool = False) -> Summary:
-        """author: the sender's name, if known; want_replies: also suggest ready-to-send replies."""
-        context = [f"Автор: {author}" if author else "Имя автора неизвестно"]
-        context.append("Варианты ответа: нужны" if want_replies else "Варианты ответа: не нужны")
+    async def summarize(self, transcript: str, author: str | None = None) -> Summary:
+        """author: the sender's name, if known."""
+        context = f"Автор: {author}" if author else "Имя автора неизвестно"
         payload = {
             "model": self.summary_model,
             "messages": [
                 {"role": "system", "content": SUMMARY_PROMPT},
-                {"role": "user", "content": "\n".join(context) + f"\n\nРасшифровка:\n\n{transcript}"},
+                {"role": "user", "content": f"{context}\n\nРасшифровка:\n\n{transcript}"},
             ],
             "temperature": 0.3,
             "max_tokens": 1500,
@@ -192,10 +154,8 @@ class OpenRouter:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise OpenRouterError(f"unexpected chat response: {str(data)[:500]}") from e
-        recap, replies = parse_summary(text or "")
         return Summary(
-            recap=recap,
-            replies=replies if want_replies else [],
+            recap=parse_summary(text or ""),
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
             reasoning_tokens=int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
@@ -217,11 +177,10 @@ async def _smoke(path: str) -> None:
             chunks = await to_mp3_chunks(Path(path), Path(tmp), settings.chunk_sec)
             parts = [await api.transcribe(c, settings.stt_language) for c in chunks]
         transcript = " ".join(p.text for p in parts)
-        summary = await api.summarize(transcript, want_replies=True)
+        summary = await api.summarize(transcript)
         stt_cost = sum(p.cost for p in parts)
         print("--- transcript ---\n" + transcript)
         print("--- summary ---\n" + summary.recap.text)
-        print("--- replies ---\n" + "\n".join(f"[{r.label}] {r.text}" for r in summary.replies))
         print(
             f"--- cost ---\nSTT ${stt_cost:.6f} ({sum(p.seconds for p in parts):.1f}s), "
             f"LLM ${summary.cost:.6f} ({summary.prompt_tokens} in / {summary.completion_tokens} out), "
