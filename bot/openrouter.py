@@ -83,9 +83,10 @@ def parse_summary(raw: str) -> Recap:
 
 
 class OpenRouter:
-    def __init__(self, api_key: str, stt_model: str, summary_model: str):
+    def __init__(self, api_key: str, stt_model: str, summary_model: str, summary_reasoning: bool = False):
         self.stt_model = stt_model
         self.summary_model = summary_model
+        self.summary_reasoning = summary_reasoning
         self.client = httpx.AsyncClient(
             base_url=BASE_URL,
             headers={"Authorization": f"Bearer {api_key}", "X-Title": "VoiceRecap"},
@@ -146,6 +147,7 @@ class OpenRouter:
             ],
             "temperature": 0.3,
             "max_tokens": 1500,
+            "reasoning": {"enabled": self.summary_reasoning},
         }
         data = await self._post("/chat/completions", payload)
         usage = data.get("usage") or {}
@@ -171,7 +173,7 @@ async def _smoke(path: str) -> None:
     from bot.config import settings
 
     logging.basicConfig(level=logging.INFO)
-    api = OpenRouter(settings.openrouter_api_key, settings.stt_model, settings.summary_model)
+    api = OpenRouter(settings.openrouter_api_key, settings.stt_model, settings.summary_model, settings.summary_reasoning)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             chunks = await to_mp3_chunks(Path(path), Path(tmp), settings.chunk_sec)

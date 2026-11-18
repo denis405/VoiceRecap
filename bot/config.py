@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     admin_id: int
 
     stt_model: str = "openai/whisper-large-v3-turbo"
-    summary_model: str = "anthropic/claude-haiku-5.5"
+    summary_model: str = "openai/gpt-6-luna"
+    # thinking tokens are billed as output: on by default, they cost 2-4x more with no gain for recaps
+    summary_reasoning: bool = False
     # default for users who haven't picked one in /settings; None = auto-detect
     stt_language: str | None = "ru"
 

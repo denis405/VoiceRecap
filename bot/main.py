@@ -21,7 +21,7 @@ async def main() -> None:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     db = Database(settings.db_path)
     await db.connect()
-    api = OpenRouter(settings.openrouter_api_key, settings.stt_model, settings.summary_model)
+    api = OpenRouter(settings.openrouter_api_key, settings.stt_model, settings.summary_model, settings.summary_reasoning)
     bot = Bot(settings.bot_token)
 
     dp = Dispatcher(db=db, api=api, jobs=asyncio.Semaphore(settings.max_concurrent_jobs))
@@ -34,8 +34,9 @@ async def main() -> None:
         await setup_profile(bot, db, settings.admin_id)
         me = await bot.get_me()
         log.info(
-            "Starting @%s (stt=%s, lang=%s, summary=%s)",
+            "Starting @%s (stt=%s, lang=%s, summary=%s, reasoning=%s)",
             me.username, settings.stt_model, settings.stt_language or "auto", settings.summary_model,
+            settings.summary_reasoning,
         )
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
