@@ -1,7 +1,10 @@
+import json
 import time
 from dataclasses import asdict, dataclass
 
 import aiosqlite
+
+from bot.openrouter import Recap
 
 PENDING = "pending"
 APPROVED = "approved"
@@ -52,6 +55,16 @@ CREATE TABLE IF NOT EXISTS user_settings (
     user_id       INTEGER PRIMARY KEY,
     stt_language  TEXT
 );
+CREATE TABLE IF NOT EXISTS recap_cache (
+    file_unique_id  TEXT NOT NULL,
+    language        TEXT NOT NULL,
+    author          TEXT NOT NULL,
+    transcript_id   INTEGER NOT NULL,
+    recap           TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (file_unique_id, language, author)
+);
+CREATE INDEX IF NOT EXISTS recap_cache_time ON recap_cache (created_at);
 """
 
 
@@ -71,6 +84,15 @@ REQ_EMPTY = "empty"
 REQ_ERROR = "error"
 REQ_TOO_LONG = "too_long"
 REQ_TOO_BIG = "too_big"
+REQ_CACHED = "cached"  # served from recap_cache, no API calls
+
+
+@dataclass
+class CachedRecap:
+    transcript_id: int
+    transcript_user_id: int
+    transcript: str
+    recap: Recap
 
 
 @dataclass
@@ -231,6 +253,50 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
+
+    # recap cache: the same Telegram file (file_unique_id) is not paid for twice.
+    # Keyed by STT language and author too: both change the result.
+
+    async def get_cached_recap(self, file_unique_id: str, language: str, author: str, since: int) -> CachedRecap | None:
+        async with self.conn.execute(
+            """SELECT c.transcript_id, t.user_id, t.text, c.recap
+               FROM recap_cache c JOIN transcripts t ON t.id = c.transcript_id
+               WHERE c.file_unique_id = ? AND c.language = ? AND c.author = ? AND c.created_at >= ?""",
+            (file_unique_id, language, author, since),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        data = json.loads(row[3])
+        return CachedRecap(row[0], row[1], row[2], Recap(data["gist"], data["points"], data["tasks"]))
+
+    async def get_cached_transcript(self, file_unique_id: str, language: str, since: int) -> str | None:
+        """The transcript of this file under any author, to skip STT."""
+        async with self.conn.execute(
+            """SELECT t.text
+               FROM recap_cache c JOIN transcripts t ON t.id = c.transcript_id
+               WHERE c.file_unique_id = ? AND c.language = ? AND c.created_at >= ?
+               ORDER BY c.created_at DESC LIMIT 1""",
+            (file_unique_id, language, since),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def cache_recap(
+        self, file_unique_id: str, language: str, author: str, transcript_id: int, recap: Recap
+    ) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO recap_cache "
+            "(file_unique_id, language, author, transcript_id, recap, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (file_unique_id, language, author, transcript_id,
+             json.dumps(asdict(recap), ensure_ascii=False), int(time.time())),
+        )
+        await self.conn.commit()
+
+    async def purge_recap_cache(self, older_than: int) -> int:
+        cur = await self.conn.execute("DELETE FROM recap_cache WHERE created_at < ?", (older_than,))
+        await self.conn.commit()
+        return cur.rowcount
 
     # usage stats
 

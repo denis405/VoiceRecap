@@ -25,7 +25,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from bot import texts
 from bot.audio import to_mp3_chunks
 from bot.config import settings
-from bot.db import REQ_EMPTY, REQ_OK, REQ_TOO_BIG, REQ_TOO_LONG, Database, Request
+from bot.db import REQ_CACHED, REQ_EMPTY, REQ_OK, REQ_TOO_BIG, REQ_TOO_LONG, Database, Request
 from bot.fmt import fmt_duration
 from bot.openrouter import OpenRouter, Recap
 
@@ -176,12 +176,61 @@ async def on_language(query: CallbackQuery, callback_data: LanguageCb, db: Datab
     log.info("User %s set STT language: %s", query.from_user.id, code)
 
 
+def cache_since() -> int:
+    """Cache entries created before this are expired (the nightly job deletes them)."""
+    return int(time.time()) - settings.recap_cache_ttl_days * 86400
+
+
+async def cached_result(db: Database, file_unique_id: str, language: str, author: str, user_id: int):
+    """(recap, transcript_id, transcript) for this user from the cache, or None. Never raises."""
+    try:
+        hit = await db.get_cached_recap(file_unique_id, language, author, cache_since())
+        if hit is None:
+            return None
+        transcript_id = hit.transcript_id
+        if hit.transcript_user_id != user_id:
+            # "full text" only serves the user's own transcripts
+            transcript_id = await db.save_transcript(user_id, hit.transcript)
+        return hit.recap, transcript_id, hit.transcript
+    except Exception:
+        log.exception("Recap cache lookup failed for %s", file_unique_id)
+        return None
+
+
+async def store_cache(db: Database, file_unique_id: str, language: str, author: str, transcript_id: int, recap: Recap) -> None:
+    try:
+        await db.cache_recap(file_unique_id, language, author, transcript_id, recap)
+    except Exception:
+        log.exception("Failed to cache recap for %s", file_unique_id)
+
+
+async def transcribe_media(
+    message: Message, media, language: str, api: OpenRouter, req: Request, status: Message
+) -> str:
+    """Download, split with ffmpeg and transcribe; STT usage is added to req."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        src = tmp_dir / ("voice.ogg" if message.voice else "note.mp4")
+        await message.bot.download(media.file_id, destination=src)
+
+        await set_status(status, texts.STATUS_TRANSCRIBING)
+        chunks = await to_mp3_chunks(src, tmp_dir, settings.chunk_sec)
+        parts = []
+        for chunk in chunks:
+            part = await api.transcribe(chunk, None if language == AUTO else language)
+            req.stt_seconds += part.seconds
+            req.stt_cost += part.cost
+            parts.append(part.text)
+    return " ".join(p for p in parts if p).strip()
+
+
 @router.message(F.voice | F.video_note)
 async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asyncio.Semaphore) -> None:
     media = message.voice or message.video_note
     duration = media.duration or 0
+    user_id = message.from_user.id
     req = Request(
-        user_id=message.from_user.id,
+        user_id=user_id,
         kind="voice" if message.voice else "video_note",
         duration_sec=duration,
         file_size=media.file_size,
@@ -200,26 +249,37 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
         await message.reply(texts.ERROR_TOO_LONG.format(max_min=settings.max_duration_sec // 60))
         return
 
+    file_unique_id = media.file_unique_id
+    language = await user_language(db, user_id)
+    author = voice_author(message)
+    author_key = author or ""
+
+    hit = await cached_result(db, file_unique_id, language, author_key, user_id)
+    if hit:
+        recap, transcript_id, transcript = hit
+        req.status = REQ_CACHED
+        req.stt_model = req.llm_model = None
+        req.transcript_id = transcript_id
+        req.transcript_chars = len(transcript)
+        req.summary_chars = len(recap.text)
+        await record_request(db, req)
+        text, keyboard = result_message(duration, recap, transcript_id)
+        await message.reply(text, reply_markup=keyboard, parse_mode="HTML")
+        log.info("Served cached recap of %s to %s", file_unique_id, user_id)
+        return
+
     status = await message.reply(texts.STATUS_DOWNLOADING)
     started = time.monotonic()
     # recorded in `finally`, so money spent before a failure is still counted
     try:
         async with jobs, ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp_dir = Path(tmp)
-                src = tmp_dir / ("voice.ogg" if message.voice else "note.mp4")
-                await message.bot.download(media.file_id, destination=src)
-
-                await set_status(status, texts.STATUS_TRANSCRIBING)
-                chunks = await to_mp3_chunks(src, tmp_dir, settings.chunk_sec)
-                language = await user_language(db, message.from_user.id)
-                parts = []
-                for chunk in chunks:
-                    part = await api.transcribe(chunk, None if language == AUTO else language)
-                    req.stt_seconds += part.seconds
-                    req.stt_cost += part.cost
-                    parts.append(part.text)
-            transcript = " ".join(p for p in parts if p).strip()
+            # same file under another author: only the summary has to be redone
+            transcript = await db.get_cached_transcript(file_unique_id, language, cache_since())
+            if transcript is None:
+                transcript = await transcribe_media(message, media, language, api, req, status)
+            else:
+                req.stt_model = None
+                log.info("Reusing cached transcript of %s for %s", file_unique_id, user_id)
             req.transcript_chars = len(transcript)
 
             if not transcript:
@@ -228,16 +288,18 @@ async def on_voice(message: Message, db: Database, api: OpenRouter, jobs: asynci
                 return
 
             await set_status(status, texts.STATUS_SUMMARIZING)
-            result = await api.summarize(transcript, voice_author(message))
+            result = await api.summarize(transcript, author)
             recap = result.recap if result.recap.text.strip() else Recap(transcript, [], [])
             req.summary_chars = len(result.recap.text)
             req.llm_prompt_tokens = result.prompt_tokens
             req.llm_completion_tokens = result.completion_tokens
             req.llm_reasoning_tokens = result.reasoning_tokens
             req.llm_cost = result.cost
-            transcript_id = await db.save_transcript(message.from_user.id, transcript)
+            transcript_id = await db.save_transcript(user_id, transcript)
             req.transcript_id = transcript_id
             req.status = REQ_OK
+            if result.recap.text.strip():
+                await store_cache(db, file_unique_id, language, author_key, transcript_id, recap)
     except Exception:
         log.exception("Failed to process message %s from %s", message.message_id, message.from_user.id)
         await set_status(status, texts.ERROR_GENERIC)

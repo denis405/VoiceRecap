@@ -8,6 +8,7 @@ from bot.access import AccessMiddleware
 from bot.config import settings
 from bot.db import Database
 from bot.handlers import admin, user
+from bot.jobs import purge_cache_nightly
 from bot.openrouter import OpenRouter
 from bot.profile import setup_profile
 
@@ -30,6 +31,7 @@ async def main() -> None:
     dp.callback_query.outer_middleware(access)
     dp.include_routers(admin.router, user.router)
 
+    cleanup = asyncio.create_task(purge_cache_nightly(db, settings.recap_cache_ttl_days))
     try:
         await setup_profile(bot, db, settings.admin_id)
         me = await bot.get_me()
@@ -40,6 +42,7 @@ async def main() -> None:
         )
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        cleanup.cancel()
         await api.close()
         await db.close()
         await bot.session.close()

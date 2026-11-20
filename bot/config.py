@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     max_duration_sec: int = 3600
     max_concurrent_jobs: int = 3
     chunk_sec: int = 600
+    # a repeated voice / video note (same Telegram file) reuses its recap for this long
+    recap_cache_ttl_days: int = 7
 
     db_path: str = "/app/data/bot.db"
 
