@@ -25,7 +25,7 @@ Push в `main` → GitHub Actions (`.github/workflows/deploy.yml`) собира�
 | Переменная | По умолчанию | |
 |---|---|---|
 | `STT_MODEL` | `openai/whisper-large-v3-turbo` | любая модель из [списка транскрибации](https://openrouter.ai/models?output_modalities=transcription) |
-| `SUMMARY_MODEL` | `openai/gpt-6-luna` | любая чат-модель OpenRouter |
+| `SUMMARY_MODEL` | `anthropic/claude-haiku-5.5` | любая чат-модель OpenRouter |
 | `SUMMARY_REASONING` | `false` | рассуждение модели перед ответом; `true` дороже в 2–4 раза, а пересказ лучше не становится |
 | `STT_LANGUAGE` | `ru` | язык расшифровки по умолчанию: ISO-639-1 или `auto` (автоопределение); пользователь может сменить его в `/settings` |
 | `MAX_DURATION_SEC` | `3600` | максимальная длина сообщения |
